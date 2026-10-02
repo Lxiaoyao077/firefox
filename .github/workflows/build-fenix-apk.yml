@@ -7,6 +7,11 @@ concurrency:
   group: fenix-apk-build
   cancel-in-progress: false
 
+env:
+  # Restrict Fenix ABI splits to arm64-v8a everywhere (mach build's internal
+  # Gradle invocations honor GRADLE_FLAGS; see fenix/app/build.gradle splits block).
+  GRADLE_FLAGS: -PbenchmarkTest=true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -54,23 +59,38 @@ jobs:
           fi
           cat mozconfig
 
-      # mach build already assembles the Fenix APKs via Gradle ("BUILD SUCCESSFUL"),
-      # no separate "mach android ..." invocation is needed (and the old
-      # build-gradle-dependencies subcommand no longer exists in the monorepo).
-      - name: Build (Gecko + Fenix APKs)
+      # mach build compiles Gecko, publishes the local GeckoView AAR into the
+      # objdir maven repo and sets up the Gradle configuration rooted at the
+      # top source directory. GRADLE_FLAGS restricts its ABI splits to arm64-v8a.
+      - name: Build (Gecko + local GeckoView)
         working-directory: firefox
         run: ./mach build
+
+      # Fenix has no product flavors: Gradle tasks are named by buildType only,
+      # so the release APK task is ":fenix:assembleRelease". Locally (not
+      # MOZ_AUTOMATION) the release buildType is signed with the debug keystore,
+      # so the APK is directly installable.
+      - name: Assemble Fenix release APK (arm64-v8a only)
+        working-directory: firefox
+        run: ./mach gradle -PbenchmarkTest=true :fenix:assembleRelease
 
       - name: Collect APKs
         run: |
           cd firefox
           mkdir -p ../apks
-          find . -name '*.apk' -not -path './apks/*' -print0 | \
+          find . -name '*arm64-v8a*release*.apk' -print0 | \
             while IFS= read -r -d '' f; do cp --parents "$f" ../apks/; done
-          echo "Collected APKs:"
+          if [ -z "$(ls -A ../apks 2>/dev/null)" ]; then
+            echo "No release APK matched; falling back to every arm64-v8a APK"
+            find . -name '*arm64-v8a*.apk' -print0 | \
+              while IFS= read -r -d '' f; do cp --parents "$f" ../apks/; done
+          fi
+          echo "All APKs present in the tree:"
+          find . -name '*.apk' -exec ls -lh {} \;
+          echo "Collected for upload:"
           find ../apks -name '*.apk' -exec ls -lh {} \;
 
-      - name: Upload APKs as artifact
+      - name: Upload APK as artifact
         uses: actions/upload-artifact@v4
         with:
           name: fenix-apks-${{ github.run_id }}
