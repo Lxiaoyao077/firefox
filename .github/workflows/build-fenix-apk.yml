@@ -2,6 +2,11 @@ name: Build Fenix APK (Firefox for Android)
 
 on:
   workflow_dispatch:
+    inputs:
+      fast:
+        description: 'Fast dev build (skip R8 minification, bigger APK)'
+        type: boolean
+        default: false
 
 concurrency:
   group: fenix-apk-build
@@ -17,6 +22,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
+      # Check out THIS fork, so local commits to mobile/android/fenix are built.
+      # Keep in sync with upstream via the GitHub "Sync fork" button.
+      - name: Check out this repository (shallow)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          path: firefox
+
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
@@ -41,9 +54,6 @@ jobs:
           sudo install "/tmp/sccache-${TAG}-x86_64-unknown-linux-musl/sccache" /usr/local/bin/sccache
           echo "SCCACHE_CACHE_SIZE=8G" >> "$GITHUB_ENV"
 
-      - name: Shallow clone upstream monorepo
-        run: git clone --depth 1 https://github.com/mozilla-firefox/firefox.git firefox
-
       - name: Bootstrap (mobile_android)
         working-directory: firefox
         run: |
@@ -60,13 +70,11 @@ jobs:
           fi
           cat mozconfig
 
-      # 1) Try artifact mode: download Mozilla's prebuilt Gecko for this exact
-      #    revision and skip the whole C++/Rust compile (~90 min -> ~10 min).
-      #    Only works when Taskcluster has artifacts for the cloned revision.
-      # 2) Fall back to a full local build with sccache wrapping C/C++ and Rust
-      #    ("ac_add_options --with-ccache=sccache"), so repeat builds hit a warm
-      #    compiler cache via the actions/cache step.
-      - name: Build (artifact mode, fallback to full build with sccache)
+      # Local commits on top of upstream mean no prebuilt artifact exists for
+      # this exact revision, so artifact mode is only a opportunistic attempt;
+      # the fallback full build with sccache ("--with-ccache=sccache") is the
+      # expected path and gets 2-3x faster compiles on a warm cache.
+      - name: Build (artifact attempt, fallback to full build with sccache)
         working-directory: firefox
         run: |
           cp mozconfig /tmp/mozconfig.orig
@@ -88,12 +96,17 @@ jobs:
       # Fenix has no product flavors: Gradle tasks are named by buildType only,
       # so the release APK task is ":fenix:assembleRelease". Locally (not
       # MOZ_AUTOMATION) the release buildType is signed with the debug keystore,
-      # so the APK is directly installable.
+      # so the APK is directly installable. The "fast" input skips R8
+      # minification (-PdisableOptimization) to shave 15-30 min off dev builds.
       - name: Assemble Fenix release APK (arm64-v8a only)
         working-directory: firefox
+        env:
+          FAST: ${{ github.event.inputs.fast }}
         run: |
           sccache --show-stats || true
-          ./mach gradle -PbenchmarkTest=true :fenix:assembleRelease
+          EXTRA=""
+          if [ "$FAST" = "true" ]; then EXTRA="-PdisableOptimization"; fi
+          ./mach gradle -PbenchmarkTest=true $EXTRA :fenix:assembleRelease
 
       - name: Collect APKs
         run: |
