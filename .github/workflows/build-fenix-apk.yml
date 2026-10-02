@@ -29,16 +29,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/sccache
-          key: sccache-linux-v1
+          key: sccache-linux-v2
           restore-keys: sccache-linux-
 
-      - name: Install sccache (best effort, for Rust compilation caching)
-        continue-on-error: true
+      - name: Install latest sccache
         run: |
-          curl -fsSL -o /tmp/sccache.tar.gz https://github.com/mozilla/sccache/releases/download/v0.9.1/sccache-v0.9.1-x86_64-unknown-linux-musl.tar.gz
+          TAG=$(curl -fsSL https://api.github.com/repos/mozilla/sccache/releases/latest | python3 -c 'import json,sys;print(json.load(sys.stdin)["tag_name"])')
+          echo "sccache version: $TAG"
+          curl -fsSL -o /tmp/sccache.tar.gz "https://github.com/mozilla/sccache/releases/download/${TAG}/sccache-${TAG}-x86_64-unknown-linux-musl.tar.gz"
           tar -xzf /tmp/sccache.tar.gz -C /tmp
-          sudo install /tmp/sccache-v0.9.1-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
-          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          sudo install "/tmp/sccache-${TAG}-x86_64-unknown-linux-musl/sccache" /usr/local/bin/sccache
+          echo "SCCACHE_CACHE_SIZE=8G" >> "$GITHUB_ENV"
 
       - name: Shallow clone upstream monorepo
         run: git clone --depth 1 https://github.com/mozilla-firefox/firefox.git firefox
@@ -59,12 +60,30 @@ jobs:
           fi
           cat mozconfig
 
-      # mach build compiles Gecko, publishes the local GeckoView AAR into the
-      # objdir maven repo and sets up the Gradle configuration rooted at the
-      # top source directory. GRADLE_FLAGS restricts its ABI splits to arm64-v8a.
-      - name: Build (Gecko + local GeckoView)
+      # 1) Try artifact mode: download Mozilla's prebuilt Gecko for this exact
+      #    revision and skip the whole C++/Rust compile (~90 min -> ~10 min).
+      #    Only works when Taskcluster has artifacts for the cloned revision.
+      # 2) Fall back to a full local build with sccache wrapping C/C++ and Rust
+      #    ("ac_add_options --with-ccache=sccache"), so repeat builds hit a warm
+      #    compiler cache via the actions/cache step.
+      - name: Build (artifact mode, fallback to full build with sccache)
         working-directory: firefox
-        run: ./mach build
+        run: |
+          cp mozconfig /tmp/mozconfig.orig
+          printf 'ac_add_options --enable-artifact-builds\n' >> mozconfig
+          echo "=== Attempting artifact build for revision $(git rev-parse --short HEAD) ==="
+          if ./mach build; then
+            echo "BUILD_MODE=artifact" >> "$GITHUB_ENV"
+            echo "=== Artifact build OK ==="
+          else
+            echo "=== Artifact build failed; falling back to full build with sccache ==="
+            grep -v 'enable-artifact-builds' /tmp/mozconfig.orig > mozconfig
+            printf 'ac_add_options --with-ccache=sccache\n' >> mozconfig
+            rm -rf obj-*
+            cat mozconfig
+            ./mach build
+            echo "BUILD_MODE=full" >> "$GITHUB_ENV"
+          fi
 
       # Fenix has no product flavors: Gradle tasks are named by buildType only,
       # so the release APK task is ":fenix:assembleRelease". Locally (not
@@ -72,7 +91,9 @@ jobs:
       # so the APK is directly installable.
       - name: Assemble Fenix release APK (arm64-v8a only)
         working-directory: firefox
-        run: ./mach gradle -PbenchmarkTest=true :fenix:assembleRelease
+        run: |
+          sccache --show-stats || true
+          ./mach gradle -PbenchmarkTest=true :fenix:assembleRelease
 
       - name: Collect APKs
         run: |
@@ -85,8 +106,7 @@ jobs:
             find . -name '*arm64-v8a*.apk' -print0 | \
               while IFS= read -r -d '' f; do cp --parents "$f" ../apks/; done
           fi
-          echo "All APKs present in the tree:"
-          find . -name '*.apk' -exec ls -lh {} \;
+          echo "Build mode: ${BUILD_MODE:-unknown}"
           echo "Collected for upload:"
           find ../apks -name '*.apk' -exec ls -lh {} \;
 
