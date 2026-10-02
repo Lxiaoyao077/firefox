@@ -1,0 +1,79 @@
+name: Build Fenix APK (Firefox for Android)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: fenix-apk-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/lib/android/sdk/ndk \
+            /imagegeneration/installers/* 2>/dev/null || true
+          sudo docker image prune -af || true
+          df -h /
+
+      - name: Restore sccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/sccache
+          key: sccache-linux-v1
+          restore-keys: sccache-linux-
+
+      - name: Install sccache (best effort, for Rust compilation caching)
+        continue-on-error: true
+        run: |
+          curl -fsSL -o /tmp/sccache.tar.gz https://github.com/mozilla/sccache/releases/download/v0.9.1/sccache-v0.9.1-x86_64-unknown-linux-musl.tar.gz
+          tar -xzf /tmp/sccache.tar.gz -C /tmp
+          sudo install /tmp/sccache-v0.9.1-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+
+      - name: Shallow clone upstream monorepo
+        run: git clone --depth 1 https://github.com/mozilla-firefox/firefox.git firefox
+
+      - name: Bootstrap (mobile_android)
+        working-directory: firefox
+        run: |
+          ./mach --no-interactive bootstrap --application-choice mobile_android
+          echo "--- mozconfig ---"
+          cat mozconfig || true
+
+      - name: Ensure mozconfig targets Android
+        working-directory: firefox
+        run: |
+          if [ ! -f mozconfig ]; then
+            printf 'ac_add_options --enable-application=mobile/android\n' > mozconfig
+            echo "created default mozconfig"
+          fi
+          cat mozconfig
+
+      # mach build already assembles the Fenix APKs via Gradle ("BUILD SUCCESSFUL"),
+      # no separate "mach android ..." invocation is needed (and the old
+      # build-gradle-dependencies subcommand no longer exists in the monorepo).
+      - name: Build (Gecko + Fenix APKs)
+        working-directory: firefox
+        run: ./mach build
+
+      - name: Collect APKs
+        run: |
+          cd firefox
+          mkdir -p ../apks
+          find . -name '*.apk' -not -path './apks/*' -print0 | \
+            while IFS= read -r -d '' f; do cp --parents "$f" ../apks/; done
+          echo "Collected APKs:"
+          find ../apks -name '*.apk' -exec ls -lh {} \;
+
+      - name: Upload APKs as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fenix-apks-${{ github.run_id }}
+          path: apks/
+          if-no-files-found: error
+          retention-days: 14
